@@ -55,6 +55,12 @@ and this project adheres to
 * `jj config gc` now also cleans up workspace configs whose paths no longer
   exist.
 
+* If the latest operation was performed in another workspace, or is a merge of
+  concurrent operations, `jj undo` now undoes the latest operation of the
+  current workspace, instead of refusing. It reverts that operation like
+  `jj op revert`, so the operations performed in other workspaces since are
+  kept.
+
 ### Fixed bugs
 
 * Date patterns such as `after:"2024-03-10 03:30"` are now resolved with the
