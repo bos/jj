@@ -1463,55 +1463,11 @@ impl MutableRepo {
 
     /// Order a set of commits in an order they should be rebased in. The result
     /// is in reverse order so the next value can be removed from the end.
+    ///
+    /// Commits that can't be rebased because the recorded rewrites would make
+    /// them their own descendants are left out of the order and returned
+    /// separately. See [`Self::find_commits_to_leave_for_rebase()`].
     async fn order_commits_for_rebase(
-        &self,
-        to_visit: Vec<Commit>,
-        new_parents_map: &HashMap<CommitId, Vec<CommitId>>,
-    ) -> BackendResult<Vec<Commit>> {
-        let to_visit_set: HashSet<CommitId> =
-            to_visit.iter().map(|commit| commit.id().clone()).collect();
-        let mut visited = HashSet::new();
-        // Calculate an order where we rebase parents first, but if the parents were
-        // rewritten, make sure we rebase the rewritten parent first.
-        let store = self.store();
-        dag_walk_async::topo_order_reverse(
-            to_visit.into_iter().map(Ok),
-            |commit| commit.id().clone(),
-            async |commit| -> Vec<BackendResult<Commit>> {
-                visited.insert(commit.id().clone());
-                let mut dependents = vec![];
-                let parent_ids = new_parents_map
-                    .get(commit.id())
-                    .map_or(commit.parent_ids(), |parent_ids| parent_ids);
-                for parent_id in parent_ids {
-                    let parent = store.get_commit_async(parent_id).await;
-                    let Ok(parent) = parent else {
-                        dependents.push(parent);
-                        continue;
-                    };
-                    if let Some(rewrite) = self.parent_mapping.get(parent.id()) {
-                        for target in rewrite.new_parent_ids() {
-                            if to_visit_set.contains(target) && !visited.contains(target) {
-                                dependents.push(store.get_commit_async(target).await);
-                            }
-                        }
-                    }
-                    if to_visit_set.contains(parent.id()) {
-                        dependents.push(Ok(parent));
-                    }
-                }
-                dependents
-            },
-            |_| panic!("graph has cycle"),
-        )
-        .await
-    }
-
-    /// Like [`Self::order_commits_for_rebase()`], but commits that can't be
-    /// rebased because the recorded rewrites would make them their own
-    /// descendants are left out of the order and returned separately. See
-    /// [`Self::find_commits_to_leave_for_rebase()`].
-    async fn order_commits_for_rebase_breaking_cycles(
         &self,
         to_visit: Vec<Commit>,
         new_parents_map: &HashMap<CommitId, Vec<CommitId>>,
@@ -1569,7 +1525,8 @@ impl MutableRepo {
     /// Concurrent operations can rewrite commits like that. For example, one
     /// operation may rebase commit X onto commit Z, while another one rebases
     /// Z onto X's child Y. Combining the two would put Z on top of Y and X
-    /// (and therefore Y) on top of Z.
+    /// (and therefore Y) on top of Z. A single operation can also do it by
+    /// recording a commit as rewritten into one of its descendants.
     ///
     /// Leaving the returned commits where they are breaks all such cycles.
     /// Their rewritten ancestors then remain visible, which typically makes
@@ -1653,6 +1610,10 @@ impl MutableRepo {
     /// adds new descendants, then the callback will not be called for those.
     /// Similarly, if the callback rewrites unrelated commits, then the callback
     /// will not be called for descendants of those commits.
+    ///
+    /// If the recorded rewrites would make some commits their own descendants,
+    /// some of those commits are left in place, and the callback is not called
+    /// for them.
     pub async fn transform_descendants(
         &mut self,
         roots: Vec<CommitId>,
@@ -1702,7 +1663,7 @@ impl MutableRepo {
         options: &RewriteRefsOptions,
         callback: impl AsyncFnMut(CommitRewriter) -> BackendResult<()>,
     ) -> BackendResult<()> {
-        let to_visit = self
+        let (to_visit, _left_in_place) = self
             .order_commits_for_rebase(commits, new_parents_map)
             .await?;
         self.transform_ordered_commits(to_visit, new_parents_map, options, callback)
@@ -1710,8 +1671,7 @@ impl MutableRepo {
     }
 
     /// Rewrites commits like [`Self::transform_commits()`], given in the order
-    /// returned by [`Self::order_commits_for_rebase()`] or
-    /// [`Self::order_commits_for_rebase_breaking_cycles()`].
+    /// returned by [`Self::order_commits_for_rebase()`].
     async fn transform_ordered_commits(
         &mut self,
         mut to_visit: Vec<Commit>,
@@ -1815,7 +1775,7 @@ impl MutableRepo {
             .find_descendants_for_rebase(roots, &RevsetExpression::none())
             .await?;
         let (to_visit, left_in_place) = self
-            .order_commits_for_rebase_breaking_cycles(commits, &HashMap::new())
+            .order_commits_for_rebase(commits, &HashMap::new())
             .await?;
         let options = RebaseOptions::default();
         let mut num_rebased = 0;
