@@ -189,7 +189,9 @@ pub async fn cmd_redo(
         template.format(&target_op_parent, formatter.as_mut())?;
         writeln!(formatter)?;
     }
-    tx.finish(
+    // Record the operation even if nothing changed, like `jj undo` does, so
+    // the next `jj redo` continues with a later operation.
+    tx.finish_even_if_unchanged(
         ui,
         format!("{REDO_OP_DESC_PREFIX}{}", target_op_parent.id().hex()),
     )

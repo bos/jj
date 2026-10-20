@@ -207,7 +207,10 @@ pub async fn cmd_undo(
         template.format(&target_op_parent, formatter.as_mut())?;
         writeln!(formatter)?;
     }
-    tx.finish(
+    // Record the operation even if nothing changed, e.g. because the undone
+    // operation renamed a workspace. Otherwise, the next `jj undo` would try to
+    // undo the same operation again instead of an earlier one.
+    tx.finish_even_if_unchanged(
         ui,
         format!("{UNDO_OP_DESC_PREFIX}{}", target_op_parent.id().hex()),
     )

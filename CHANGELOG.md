@@ -89,6 +89,10 @@ and this project adheres to
   workspace now keeps its new name. This only works for workspaces renamed by
   this version of jj or later.
 
+* `jj undo` and `jj redo` now record an operation even if it doesn't change the
+  repo, such as when undoing a workspace rename. Previously, repeating the
+  command would try to undo or redo the same operation again.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights
