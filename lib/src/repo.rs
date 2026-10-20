@@ -706,6 +706,16 @@ pub struct RepoLoader {
     submodule_store: Arc<dyn SubmoduleStore>,
 }
 
+/// Statistics about the merge done by [`RepoLoader::merge_operations()`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergeOperationsStats {
+    /// Number of commits rebased onto commits rewritten by another operation.
+    pub num_rebased: usize,
+    /// Commits that were left in place because the operations rewrote commits
+    /// in ways that would have made them their own descendants.
+    pub commits_left_in_place: Vec<CommitId>,
+}
+
 impl RepoLoader {
     pub fn new(
         settings: UserSettings,
@@ -809,7 +819,7 @@ impl RepoLoader {
                 let workspace_name = None;
                 let transaction_description = Some("reconcile divergent operations");
                 let transaction_attributes = [];
-                let (merged_repo, _num_rebased) = self
+                let (merged_repo, _stats) = self
                     .merge_operations(
                         op_heads,
                         workspace_name,
@@ -863,8 +873,8 @@ impl RepoLoader {
         Ok(Operation::new(self.op_store.clone(), id.clone(), data))
     }
 
-    /// Merges the given `operations`. Returns the merged repo and the number of
-    /// rebased commits. If `operations` is empty returns the root repo. If
+    /// Merges the given `operations`. Returns the merged repo and statistics
+    /// about the merge. If `operations` is empty returns the root repo. If
     /// `operations` has a single entry, returns that entry's repo. Otherwise
     /// an actual merge happens. The new operation is not published.
     pub async fn merge_operations(
@@ -873,7 +883,7 @@ impl RepoLoader {
         workspace_name: Option<&WorkspaceName>,
         transaction_description: Option<&str>,
         transaction_attributes: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<(Arc<ReadonlyRepo>, usize), RepoLoaderError> {
+    ) -> Result<(Arc<ReadonlyRepo>, MergeOperationsStats), RepoLoaderError> {
         // IMPLEMENTATION NOTE: This used to be implemented as a much simple
         // recursive method, but unfortunately due to the async nature of the
         // method itself and its dependencies, that leads to stack-overflow in
@@ -883,16 +893,16 @@ impl RepoLoader {
             [] => {
                 let root_operation = self.root_operation().await;
                 let root_repo = self.load_at(&root_operation).await?;
-                return Ok((root_repo, 0));
+                return Ok((root_repo, MergeOperationsStats::default()));
             }
             [op] => {
                 let repo = self.load_at(op).await?;
-                return Ok((repo, 0));
+                return Ok((repo, MergeOperationsStats::default()));
             }
             _ => {}
         }
 
-        let mut num_rebased = 0;
+        let mut stats = MergeOperationsStats::default();
         let to_operation_ids =
             |ops: &[Operation]| ops.iter().map(|op| op.id().clone()).collect_vec();
         let operation_ids = to_operation_ids(&operations);
@@ -964,7 +974,10 @@ impl RepoLoader {
                 // We have the merge of the ancestor operations. We can proceed to merge with
                 // other_op.
                 tx.merge_operation(merged_ancestor_op, other_op).await?;
-                num_rebased += tx.repo_mut().rebase_descendants_after_merge().await?;
+                let (num_rebased, commits_left_in_place) =
+                    tx.repo_mut().rebase_descendants_after_merge().await?;
+                stats.num_rebased += num_rebased;
+                stats.commits_left_in_place.extend(commits_left_in_place);
                 // Push state on the stack to continue merging the rest of the operations.
                 stack.push((index + 1, operations, tx));
                 continue;
@@ -982,7 +995,7 @@ impl RepoLoader {
 
         // We are all done! The result should be in the cache.
         let merged_operation = merged_operations.get(&operation_ids).cloned().unwrap();
-        Ok((self.load_at(&merged_operation).await?, num_rebased))
+        Ok((self.load_at(&merged_operation).await?, stats))
     }
 
     async fn finish_load(
@@ -1496,13 +1509,13 @@ impl MutableRepo {
 
     /// Like [`Self::order_commits_for_rebase()`], but commits that can't be
     /// rebased because the recorded rewrites would make them their own
-    /// descendants are left out of the order. See
+    /// descendants are left out of the order and returned separately. See
     /// [`Self::find_commits_to_leave_for_rebase()`].
     async fn order_commits_for_rebase_breaking_cycles(
         &self,
         to_visit: Vec<Commit>,
         new_parents_map: &HashMap<CommitId, Vec<CommitId>>,
-    ) -> BackendResult<Vec<Commit>> {
+    ) -> BackendResult<(Vec<Commit>, Vec<CommitId>)> {
         let start_ids = to_visit
             .iter()
             .map(|commit| commit.id().clone())
@@ -1543,10 +1556,11 @@ impl MutableRepo {
                 )
             },
         )?;
-        Ok(sorted_ids
+        let sorted_commits = sorted_ids
             .into_iter()
             .map(|id| commits.remove(&id).unwrap())
-            .collect())
+            .collect();
+        Ok((sorted_commits, left_in_place))
     }
 
     /// Finds commits that can't be rebased because the recorded rewrites would
@@ -1791,15 +1805,16 @@ impl MutableRepo {
     /// Rebase descendants of the rewritten commits after merging concurrent
     /// operations.
     ///
-    /// This is like [`MutableRepo::rebase_descendants`], except that commits
-    /// that would be rebased onto their own descendants, which concurrent
-    /// operations can cause, are left in place.
-    async fn rebase_descendants_after_merge(&mut self) -> BackendResult<usize> {
+    /// This is like [`MutableRepo::rebase_descendants`], but it also returns
+    /// the ids of the commits that were left in place because they would have
+    /// been rebased onto their own descendants, which concurrent operations
+    /// can cause.
+    async fn rebase_descendants_after_merge(&mut self) -> BackendResult<(usize, Vec<CommitId>)> {
         let roots = self.parent_mapping.keys().cloned().collect();
         let commits = self
             .find_descendants_for_rebase(roots, &RevsetExpression::none())
             .await?;
-        let to_visit = self
+        let (to_visit, left_in_place) = self
             .order_commits_for_rebase_breaking_cycles(commits, &HashMap::new())
             .await?;
         let options = RebaseOptions::default();
@@ -1818,7 +1833,7 @@ impl MutableRepo {
         )
         .await?;
         self.parent_mapping.clear();
-        Ok(num_rebased)
+        Ok((num_rebased, left_in_place))
     }
 
     /// Reparent descendants of the rewritten commits.
