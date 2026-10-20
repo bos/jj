@@ -83,6 +83,12 @@ and this project adheres to
   and `jj` commands could import partially fetched refs, causing divergence.
   [#7349](https://github.com/jj-vcs/jj/issues/7349)
 
+* Undoing or reverting `jj workspace rename`, or restoring an operation from
+  before it, no longer leaves the workspace without a working-copy commit.
+  The workspace's working copy can't be renamed back from there, so the
+  workspace now keeps its new name. This only works for workspaces renamed by
+  this version of jj or later.
+
 ## [0.46.0] - 2026-10-07
 
 ### Release highlights
